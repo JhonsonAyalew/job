@@ -2,15 +2,15 @@ services:
   - type: cron
     name: ethiopian-jobs-bot
     runtime: python
-    schedule: "0 */4 * * *"
+    schedule: "*/5 * * * *"  # Runs every 5 minutes for testing!
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        value: dummy
+        sync: false
       - key: CHANNEL_ID
         value: "@trytry1221"
       - key: GIST_TOKEN
-        value: dummy
+        sync: false
       - key: GIST_ID
-        value: dummy
+        sync: false

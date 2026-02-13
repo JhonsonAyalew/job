@@ -5,17 +5,21 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from datetime import datetime, timedelta
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 import json
 import os
 from urllib.parse import quote
+import base64
 
 # ====================================
-# CONFIG - RENDER DISK + 4 HOUR CRON
+# CONFIG - ENVIRONMENT VARIABLES
 # ====================================
-TOKEN = os.environ.get("BOT_TOKEN", "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w")  # Added env var support
-CHANNEL_ID = "@trytry1221"
+TOKEN = os.environ.get("BOT_TOKEN", "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@trytry1221")
 DELAY_BETWEEN_POSTS = 4
+
+# GitHub Gist Config - Set these in Render environment variables
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
+GIST_ID = os.environ.get("GIST_ID", "")
 
 BASE_URL = "https://geezjobs.com"
 URL = "https://geezjobs.com/jobs-in-ethiopia"
@@ -24,12 +28,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 }
 
-# ====================================
-# RENDER DISK STORAGE - ONLY CHANGE 1
-# ====================================
-DISK_PATH = "/var/data"
-os.makedirs(DISK_PATH, exist_ok=True)
-POSTED_JOBS_FILE = os.path.join(DISK_PATH, "posted_jobs.json")
+# Local fallback file
+LOCAL_JOBS_FILE = "posted_jobs.json"
 
 # ====================================
 # LOGGER
@@ -39,35 +39,109 @@ def log(message):
     print(f"[{now}] {message}")
 
 # ====================================
-# POSTED JOBS TRACKING - FIXED to use URL
+# POSTED JOBS TRACKING - GITHUB GIST STORAGE
 # ====================================
 def load_posted_jobs():
-    """Load previously posted job URLs from file"""
-    if os.path.exists(POSTED_JOBS_FILE):
+    """Load previously posted job URLs from GitHub Gist (with local fallback)"""
+    # Try to load from Gist first
+    if GIST_TOKEN and GIST_ID:
         try:
-            with open(POSTED_JOBS_FILE, 'r') as f:
+            url = f"https://api.github.com/gists/{GIST_ID}"
+            headers = {
+                "Authorization": f"token {GIST_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                gist_data = response.json()
+                if "posted_jobs.json" in gist_data["files"]:
+                    content = gist_data["files"]["posted_jobs.json"]["content"]
+                    data = json.loads(content)
+                    
+                    # Clean jobs older than 7 days
+                    current_time = datetime.now()
+                    valid_jobs = {}
+                    for job_url, timestamp in data.items():
+                        try:
+                            job_time = datetime.fromisoformat(timestamp)
+                            if current_time - job_time < timedelta(days=7):
+                                valid_jobs[job_url] = timestamp
+                        except:
+                            continue
+                    
+                    log(f"📂 Loaded {len(valid_jobs)} jobs from GitHub Gist")
+                    return valid_jobs
+        except Exception as e:
+            log(f"⚠️ Error loading from Gist: {e}")
+    
+    # Fallback to local file
+    return load_local_posted_jobs()
+
+def save_posted_job(job_url):
+    """Save a posted job URL with timestamp to GitHub Gist and local file"""
+    posted_jobs = load_posted_jobs()
+    posted_jobs[job_url] = datetime.now().isoformat()
+    
+    # Always save locally first
+    save_local_posted_job(job_url)
+    
+    # Try to save to Gist
+    if GIST_TOKEN and GIST_ID:
+        try:
+            url = f"https://api.github.com/gists/{GIST_ID}"
+            headers = {
+                "Authorization": f"token {GIST_TOKEN}",
+                "Accept": "application/vnd.github.v3+json"
+            }
+            data = {
+                "files": {
+                    "posted_jobs.json": {
+                        "content": json.dumps(posted_jobs, indent=2)
+                    }
+                }
+            }
+            response = requests.patch(url, json=data, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                log(f"💾 Saved job to GitHub Gist: {extract_job_id(job_url)}")
+            else:
+                log(f"⚠️ Gist save failed: {response.status_code}")
+        except Exception as e:
+            log(f"⚠️ Error saving to Gist: {e}")
+
+def load_local_posted_jobs():
+    """Fallback: load from local file"""
+    if os.path.exists(LOCAL_JOBS_FILE):
+        try:
+            with open(LOCAL_JOBS_FILE, 'r') as f:
                 data = json.load(f)
                 # Clean jobs older than 7 days
                 current_time = datetime.now()
                 valid_jobs = {}
                 for job_url, timestamp in data.items():
-                    job_time = datetime.fromisoformat(timestamp)
-                    if current_time - job_time < timedelta(days=7):
-                        valid_jobs[job_url] = timestamp
+                    try:
+                        job_time = datetime.fromisoformat(timestamp)
+                        if current_time - job_time < timedelta(days=7):
+                            valid_jobs[job_url] = timestamp
+                    except:
+                        continue
+                log(f"📂 Loaded {len(valid_jobs)} jobs from local file")
                 return valid_jobs
         except Exception as e:
-            log(f"Error loading posted jobs: {e}")
+            log(f"⚠️ Error loading local jobs: {e}")
     return {}
 
-def save_posted_job(job_url):
-    """Save a posted job URL with timestamp"""
-    posted_jobs = load_posted_jobs()
+def save_local_posted_job(job_url):
+    """Fallback: save to local file"""
+    posted_jobs = load_local_posted_jobs()
     posted_jobs[job_url] = datetime.now().isoformat()
     try:
-        with open(POSTED_JOBS_FILE, 'w') as f:
+        with open(LOCAL_JOBS_FILE, 'w') as f:
             json.dump(posted_jobs, f, indent=2)
+        log(f"💾 Saved job to local file: {extract_job_id(job_url)}")
     except Exception as e:
-        log(f"Error saving posted job: {e}")
+        log(f"❌ Error saving local job: {e}")
 
 def is_job_posted(job_url):
     """Check if job has been posted before using URL"""
@@ -94,11 +168,8 @@ def format_deadline(date_text):
 # ====================================
 def generate_mini_app_url(job_url, job_title):
     """Generate a Telegram Mini App URL for the job"""
-    # You need to host a web app that displays jobs
-    # This is a placeholder - you need to deploy your own web app
     base_web_app_url = "https://your-telegram-mini-app.com/job"
     
-    # Encode parameters
     params = {
         'url': job_url,
         'title': job_title[:100],
@@ -148,7 +219,7 @@ def scrape_job_detail(job_url):
             current_section = None
             current_content = []
             
-            for element in job_content.find_all(["p"]):
+            for element in job_content.find_all(["p", "li", "ul"]):
                 if element.name in ["b", "strong", "h2", "h3", "h4", "h5"]:
                     header_text = element.get_text(strip=True)
                     
@@ -188,10 +259,10 @@ def scrape_job_detail(job_url):
                 for p in job_content.find_all("p"):
                     text = p.get_text(" ", strip=True)
                     if text and len(text) > 20 and "how to apply" not in text.lower():
-                        paragraphs.append(text)
+                        paragraphs.append(text[:200])
             
             if paragraphs:
-                fallback_text = "\n".join(paragraphs[:8])
+                fallback_text = "\n".join(paragraphs[:5])
                 words = fallback_text.split()
                 if len(words) > 20:
                     fallback_text = ' '.join(words[:20]) + "..."
@@ -203,7 +274,7 @@ def scrape_job_detail(job_url):
             full_description = "ዝርዝር መረጃ አልተገኘም"
         
         job_id = extract_job_id(job_url)
-        log(f"✔ Finished: {title} - ID: {job_id}")
+        log(f"✔ Finished: {title[:30]}... - ID: {job_id}")
 
         return {
             "id": job_id,
@@ -232,18 +303,19 @@ def scrape_new_jobs():
         job_links = [
             BASE_URL + a["href"]
             for a in soup.find_all("a", class_="color-green")
+            if a.get("href")
         ]
 
         log(f"🔎 Found {len(job_links)} total jobs")
 
-        # Filter out already posted jobs - USING URL NOW
+        # Filter out already posted jobs
         new_job_links = []
-        for link in job_links:
-            if not is_job_posted(link):  # Now checks using URL
+        for link in job_links[:15]:  # Limit to 15 jobs per cycle
+            if not is_job_posted(link):
                 new_job_links.append(link)
             else:
                 job_id = extract_job_id(link)
-                log(f"⏭ Skipping already posted job {job_id} - {link}")
+                log(f"⏭ Skipping already posted job {job_id}")
 
         log(f"🆕 Found {len(new_job_links)} new jobs to post")
 
@@ -252,9 +324,8 @@ def scrape_new_jobs():
             return []
 
         jobs = []
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:10]]  # Limit to 10 per cycle
-
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = [executor.submit(scrape_job_detail, link) for link in new_job_links]
             for future in as_completed(futures):
                 result = future.result()
                 if result:
@@ -301,10 +372,10 @@ async def post_job(bot, job):
 🔔 ማሳሰቢያ: ዛሬ ያመልክቱ! ነገ አይዘገዩ!
 """
 
-    # Create buttons with Mini App support
+    # Create buttons
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 አመልክት / APPLY", url=job["link"]),
+            InlineKeyboardButton("📋 አመልክት (Open)", url=job["link"]),
            
         ],
         [InlineKeyboardButton("📢 ሌሎች ስራዎች", url="https://t.me/trytry1221")]
@@ -319,8 +390,8 @@ async def post_job(bot, job):
             disable_web_page_preview=False
         )
         
-        # Save the posted job - USING URL NOW
-        save_posted_job(job['link'])  # Save the full URL, not the ID
+        # Save the posted job
+        save_posted_job(job['link'])
             
         print(f"✅ ተለጠፈ: {job['title'][:50]}...")
         return True
@@ -363,11 +434,10 @@ async def job_posting_cycle(bot):
     
     print("\n" + "═"*50)
     print(f"     ✅ {posted_count}/{len(new_jobs)} ስራዎች በተሳካ ሁኔታ ተለጥፈዋል!")
-    print(f"     ⏭ ቀጣይ ማረሚያ በ{SCRAPE_INTERVAL} ሰከንድ ውስጥ...")
     print("═"*50 + "\n")
 
 # ====================================
-# MAIN - 4 HOUR CRON VERSION (ONLY CHANGE 2)
+# MAIN - 4 HOUR CRON VERSION
 # ====================================
 async def main():
     bot = Bot(token=TOKEN)
@@ -380,35 +450,27 @@ async def main():
     """)
     
     print(f"📊 የሚረምረው በየ 4 ሰዓት (Render Cron)")
-    print(f"📁 የRender Cron)")
-    print(f"📁 የተለጠፉተለጠፉ ስ ስራዎችራዎች መዝ መዝገብ: {POSTED_JOBS_FILEገብ: {POSTED_JOBS_FILE}")
-    print(f"}")
-    print(f"📋📋 የሚ የሚለጠፍለጠፍበትበት ቻናል: {CH ቻናል: {CHANNEL_ID}")
-    print("═"ANNEL_ID}")
-    print("═"*60 + "\*60 + "\n")
+    print(f"📁 የተለጠፉ ስራዎች መዝገብ: GitHub Gist + Local")
+    print(f"📋 የሚለጠፍበት ቻናል: {CHANNEL_ID}")
     
-    # Run ONCE -n")
+    if GIST_TOKEN and GIST_ID:
+        print(f"✅ GitHub Gist storage: ACTIVE")
+    else:
+        print(f"⚠️ GitHub Gist storage: DISABLED (using local file only)")
     
-    # Run ONCE - not forever (for cron job)
-    not forever (for cron job)
+    print("═"*60 + "\n")
+    
+    # Run ONCE for cron job
     await job_posting_cycle(bot)
- await job_posting_cycle(bot)
     
-    print(f"✅    
-    print(f"✅ 4 ሰ 4 ሰዓት ዑደት ተዓት ዑደት ተጠናቋጠናቋልል - { - {datetime.now()}datetime.now()}")
-
-if __")
+    print(f"✅ 4 ሰዓት ዑደት ተጠናቋል - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
-    tryname__ == "__main__":
-:
-        asyn    try:
+    try:
         asyncio.run(main())
     except KeyboardInterrupt:
-       cio.run(main())
-    except KeyboardInterrupt:
-        print("\ print("\nn\n⚠️\n⚠️ ፕ ፕሮሮግራግራምም ቆሟል ( ቆሟል (Program stoppedProgram stopped by user)")
+        print("\n\n⚠️ ፕሮግራም ቆሟል (Program stopped by user)")
     except Exception as e:
- by user)")
-    except Exception as e:
-        print(f"\n        print(f"\n❌❌ ከባ ከባድ ስድህተት: {e}")
+        print(f"\n❌ ከባድ ስህተት: {e}")
+        import traceback
+        traceback.print_exc()

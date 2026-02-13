@@ -2,7 +2,7 @@ services:
   - type: cron
     name: ethiopian-jobs-bot
     runtime: python
-    schedule: "0 */8 * * *"
+    schedule: "0 */2 * * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:

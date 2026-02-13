@@ -375,7 +375,7 @@ async def post_job(bot, job):
     # Create buttons
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📋 አመልክት (Open)", url=job["link"]),
+            InlineKeyboardButton("📋 አመልክት / APPLY", url=job["link"]),
            
         ],
         [InlineKeyboardButton("📢 ሌሎች ስራዎች", url="https://t.me/trytry1221")]

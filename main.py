@@ -143,7 +143,7 @@ def scrape_job_detail(job_url):
             current_section = None
             current_content = []
             
-            for element in job_content.find_all(["p", "li", "ul", "h2", "h3", "h4", "h5"]):
+            for element in job_content.find_all(["p"]):
                 if element.name in ["h2", "h3", "h4", "h5"]:
                     header_text = element.get_text(strip=True)
                     
@@ -252,7 +252,7 @@ def scrape_new_jobs():
             return []
 
         jobs = []
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=15) as executor:
             futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:10]]  # Limit to 10
             for future in as_completed(futures):
                 result = future.result()

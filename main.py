@@ -19,7 +19,7 @@ TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID", "@trytry1221")
 DELAY_BETWEEN_POSTS = 4
 
-# GitHub Gist Config
+# GitHub Gist Config - REQUIRED
 GIST_TOKEN = os.environ.get("GIST_TOKEN")
 GIST_ID = os.environ.get("GIST_ID", "6de7206ca0a1010314e34e984d8dc78e")
 
@@ -30,9 +30,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# Local fallback file
-LOCAL_JOBS_FILE = "posted_jobs.json"
-
 # ====================================
 # LOGGER
 # ====================================
@@ -41,47 +38,127 @@ def log(message):
     print(f"[{now}] {message}")
 
 # ====================================
-# POSTED JOBS TRACKING - SIMPLIFIED LOCAL STORAGE FIRST
+# POSTED JOBS TRACKING - GITHUB GIST ONLY
 # ====================================
 def load_posted_jobs():
-    """Load previously posted job URLs from local file"""
-    if os.path.exists(LOCAL_JOBS_FILE):
-        try:
-            with open(LOCAL_JOBS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Clean jobs older than 7 days
-                current_time = datetime.now()
-                valid_jobs = {}
-                for job_url, timestamp in data.items():
-                    try:
-                        job_time = datetime.fromisoformat(timestamp)
-                        if current_time - job_time < timedelta(days=7):
+    """Load previously posted job URLs from GitHub Gist ONLY"""
+    posted_jobs = {}
+    
+    if not GIST_TOKEN:
+        log("❌ GIST_TOKEN not set! Cannot load jobs.")
+        return {}
+    
+    if not GIST_ID:
+        log("❌ GIST_ID not set! Cannot load jobs.")
+        return {}
+    
+    try:
+        gist_url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {
+            "Authorization": f"token {GIST_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        log(f"📡 Loading from Gist: {gist_url}")
+        response = requests.get(gist_url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            gist_data = response.json()
+            
+            # Check if file exists in gist
+            if "files" in gist_data and "posted_jobs.json" in gist_data["files"]:
+                content = gist_data["files"]["posted_jobs.json"]["content"]
+                if content.strip():
+                    data = json.loads(content)
+                    
+                    # Clean jobs older than 7 days
+                    current_time = datetime.now()
+                    valid_jobs = {}
+                    for job_url, timestamp in data.items():
+                        try:
+                            job_time = datetime.fromisoformat(timestamp)
+                            if current_time - job_time < timedelta(days=7):
+                                valid_jobs[job_url] = timestamp
+                        except (ValueError, TypeError):
+                            # If timestamp is invalid, keep the job but update timestamp later
                             valid_jobs[job_url] = timestamp
-                    except (ValueError, TypeError):
-                        # If timestamp is invalid, keep the job but update timestamp later
-                        valid_jobs[job_url] = timestamp
-                log(f"📂 Loaded {len(valid_jobs)} jobs from local file")
-                return valid_jobs
-        except Exception as e:
-            log(f"⚠️ Error loading local jobs: {str(e)}")
-    return {}
+                    
+                    log(f"📂 Loaded {len(valid_jobs)} jobs from GitHub Gist")
+                    return valid_jobs
+            else:
+                log("📁 posted_jobs.json not found in Gist, starting fresh")
+                return {}
+        else:
+            log(f"⚠️ Gist load failed: {response.status_code} - {response.text[:200]}")
+            return {}
+            
+    except Exception as e:
+        log(f"❌ Error loading from Gist: {str(e)}")
+        return {}
 
 def save_posted_jobs(posted_jobs):
-    """Save all posted jobs to local file"""
+    """Save all posted jobs to GitHub Gist ONLY"""
+    if not GIST_TOKEN:
+        log("❌ GIST_TOKEN not set! Cannot save jobs.")
+        return False
+    
+    if not GIST_ID:
+        log("❌ GIST_ID not set! Cannot save jobs.")
+        return False
+    
     try:
-        with open(LOCAL_JOBS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(posted_jobs, f, indent=2, ensure_ascii=False)
-        log(f"💾 Saved {len(posted_jobs)} jobs to local file")
+        gist_url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {
+            "Authorization": f"token {GIST_TOKEN}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        # First, get current gist to preserve other files
+        get_response = requests.get(gist_url, headers=headers, timeout=15)
+        current_files = {}
+        
+        if get_response.status_code == 200:
+            current_data = get_response.json()
+            current_files = current_data.get("files", {})
+        
+        # Prepare files for update
+        files_data = {}
+        
+        # Copy existing files (if any)
+        for filename in current_files:
+            if filename != "posted_jobs.json":
+                files_data[filename] = {"content": current_files[filename]["content"]}
+        
+        # Add/update posted_jobs.json
+        files_data["posted_jobs.json"] = {
+            "content": json.dumps(posted_jobs, indent=2, ensure_ascii=False)
+        }
+        
+        data = {"files": files_data}
+        
+        log(f"📤 Saving to Gist: {len(posted_jobs)} jobs")
+        response = requests.patch(gist_url, json=data, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            log(f"✅ Successfully saved to GitHub Gist")
+            log(f"🔗 View at: https://gist.github.com/{GIST_ID}")
+            return True
+        else:
+            log(f"❌ Gist save failed: {response.status_code} - {response.text[:200]}")
+            return False
+            
     except Exception as e:
-        log(f"❌ Error saving local jobs: {str(e)}")
+        log(f"❌ Error saving to Gist: {str(e)}")
+        return False
 
 def save_posted_job(job_url):
-    """Save a single posted job URL with timestamp"""
+    """Save a single posted job URL with timestamp to Gist"""
     posted_jobs = load_posted_jobs()
     posted_jobs[job_url] = datetime.now().isoformat()
-    save_posted_jobs(posted_jobs)
-    job_id = extract_job_id(job_url)
-    log(f"💾 Saved job: {job_id}")
+    success = save_posted_jobs(posted_jobs)
+    if success:
+        job_id = extract_job_id(job_url)
+        log(f"💾 Saved job to Gist: {job_id}")
 
 def is_job_posted(job_url):
     """Check if job has been posted before using URL"""
@@ -238,14 +315,17 @@ def scrape_new_jobs():
 
         # Filter out already posted jobs
         new_job_links = []
+        skipped_count = 0
         for link in job_links[:15]:  # Limit to 15 jobs per cycle
             if not is_job_posted(link):
                 new_job_links.append(link)
             else:
+                skipped_count += 1
                 job_id = extract_job_id(link)
                 log(f"⏭ Skipping already posted job {job_id}")
 
         log(f"🆕 Found {len(new_job_links)} new jobs to post")
+        log(f"⏭ Skipped {skipped_count} already posted jobs")
 
         if not new_job_links:
             log("📭 No new jobs found")
@@ -304,7 +384,7 @@ async def post_job(bot, job):
             disable_web_page_preview=False
         )
         
-        # Save the posted job
+        # Save the posted job to Gist
         save_posted_job(job['link'])
         
         log(f"✅ Posted: {job['title'][:50]}...")
@@ -372,9 +452,27 @@ async def main():
     log(f"🔍 DEBUG: GIST_TOKEN exists: {bool(GIST_TOKEN)}")
     log(f"🔍 DEBUG: GIST_ID: {GIST_ID}")
     
-    # ============ CHECK BOT TOKEN ============
+    # ============ CHECK REQUIRED TOKENS ============
     if not TOKEN:
         log("❌ BOT_TOKEN environment variable not set!")
+        return
+    
+    if not GIST_TOKEN:
+        log("❌ GIST_TOKEN environment variable not set! Gist storage required.")
+        return
+    
+    if not GIST_ID:
+        log("❌ GIST_ID environment variable not set! Gist storage required.")
+        return
+    
+    # ============ TEST GITHUB GIST ACCESS ============
+    try:
+        test_jobs = {"test": "connection_test", "timestamp": datetime.now().isoformat()}
+        save_posted_jobs(test_jobs)
+        log("✅ GitHub Gist access confirmed")
+    except Exception as e:
+        log(f"❌ GitHub Gist access failed: {str(e)}")
+        log("🔍 Make sure your GIST_TOKEN has 'gist' scope and GIST_ID is correct")
         return
     
     # ============ TEST BOT CONNECTION ============
@@ -391,7 +489,7 @@ async def main():
     try:
         test_message = await bot.send_message(
             chat_id=CHANNEL_ID,
-            text=f"🔧 Test message from cron job - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nIf you see this, the bot can post to the channel!",
+            text=f"🔧 Test message from cron job - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nIf you see this, the bot can post to the channel!\n\n📁 Using Gist storage: {GIST_ID}",
             parse_mode="HTML"
         )
         log(f"✅ Successfully sent test message to channel (Message ID: {test_message.message_id})")
@@ -401,19 +499,8 @@ async def main():
         log(f"🔍 Traceback: {traceback.format_exc()}")
         return
     
-    # ============ CHECK LOCAL FILE ACCESS ============
-    try:
-        # Test writing to local file
-        test_data = {"test": "cron_job_test", "timestamp": datetime.now().isoformat()}
-        with open("test_write.txt", "w") as f:
-            f.write("Test write access")
-        os.remove("test_write.txt")
-        log("✅ Local file system: Read/Write access confirmed")
-    except Exception as e:
-        log(f"⚠️ Local file system issue: {str(e)}")
-    
-    log(f"📁 Using local file for storage: {LOCAL_JOBS_FILE}")
     log(f"📋 Channel: {CHANNEL_ID}")
+    log(f"📁 Using GitHub Gist for storage: https://gist.github.com/{GIST_ID}")
     
     print("═"*60 + "\n")
     

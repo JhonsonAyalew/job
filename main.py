@@ -422,7 +422,7 @@ async def job_posting_cycle(bot):
     
     posted_count = 0
     for index, job in enumerate(new_jobs, 1):
-        log(f"📤 [{index}/{len(new_jobs)]} Posting: {job['title'][:30]}...")
+        log(f"📤 [{index}/{len(new_jobs)}] Posting: {job['title'][:30]}...")
         success = await post_job(bot, job)
         if success:
             posted_count += 1

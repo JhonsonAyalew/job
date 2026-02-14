@@ -9,7 +9,7 @@ services:
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        value: 8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w
+        value: dummy
       - key: CHANNEL_ID
         value: "@trytry1221"
       - key: GIST_TOKEN

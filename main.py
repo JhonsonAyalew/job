@@ -252,7 +252,7 @@ def scrape_new_jobs():
             return []
 
         jobs = []
-        with ThreadPoolExecutor(max_workers=15) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:10]]  # Limit to 10
             for future in as_completed(futures):
                 result = future.result()

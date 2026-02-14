@@ -3,14 +3,16 @@ services:
     name: ethiopian-jobs-bot
     runtime: python
     schedule: "0 */2 * * *"
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
-        value: dummy
+        value: 8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w
       - key: CHANNEL_ID
         value: "@trytry1221"
       - key: GIST_TOKEN
-        value: dummy
+        value: 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
       - key: GIST_ID
-        value: dummy
+        value: "6de7206ca0a1010314e34e984d8dc78e"

@@ -393,7 +393,7 @@ def scrape_job_detail(job_url):
         
         if job_content:
             # Extract structured content
-            headers = job_content.find_all(["h2", "h3", "h4", "h5"])
+            headers = job_content.find_all(["p"])
             
             for header in headers[:4]:  # Limit sections
                 section_title = clean_text(header.get_text())

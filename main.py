@@ -32,7 +32,7 @@ HEADERS = {
 
 # Global cache for posted jobs to avoid repeated Gist reads
 _posted_jobs_cache = None
-_last_cache_update = None
+_cache_lock = asyncio.Lock()
 
 # ====================================
 # LOGGER
@@ -46,20 +46,15 @@ def log(message):
 # ====================================
 def load_posted_jobs(force_refresh=False):
     """Load previously posted job URLs from GitHub Gist ONLY with caching"""
-    global _posted_jobs_cache, _last_cache_update
+    global _posted_jobs_cache
     
-    # Use cache if available and not forcing refresh
+    # For force_refresh, always fetch from Gist
     if not force_refresh and _posted_jobs_cache is not None:
-        if _last_cache_update and (datetime.now() - _last_cache_update) < timedelta(minutes=5):
-            log(f"📋 Using cached jobs: {len(_posted_jobs_cache)} jobs")
-            return _posted_jobs_cache.copy()
+        log(f"📋 Using cache: {len(_posted_jobs_cache)} jobs")
+        return _posted_jobs_cache.copy()
     
-    if not GIST_TOKEN:
-        log("❌ GIST_TOKEN not set! Cannot load jobs.")
-        return {}
-    
-    if not GIST_ID:
-        log("❌ GIST_ID not set! Cannot load jobs.")
+    if not GIST_TOKEN or not GIST_ID:
+        log("❌ GIST_TOKEN or GIST_ID not set!")
         return {}
     
     try:
@@ -69,59 +64,65 @@ def load_posted_jobs(force_refresh=False):
             "Accept": "application/vnd.github.v3+json"
         }
         
-        log(f"📡 Loading from Gist: {gist_url}")
+        log(f"📡 Loading from Gist...")
         response = requests.get(gist_url, headers=headers, timeout=15)
         
         if response.status_code == 200:
             gist_data = response.json()
             
-            # Check if file exists in gist
             if "files" in gist_data and "posted_jobs.json" in gist_data["files"]:
                 content = gist_data["files"]["posted_jobs.json"]["content"]
-                if content.strip():
+                if content and content.strip():
                     data = json.loads(content)
                     
                     # Clean jobs older than 7 days
                     current_time = datetime.now()
                     valid_jobs = {}
+                    removed_count = 0
+                    
                     for job_url, timestamp in data.items():
                         try:
-                            job_time = datetime.fromisoformat(timestamp)
+                            # Handle both ISO format and simple strings
+                            if isinstance(timestamp, str):
+                                try:
+                                    job_time = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                                except ValueError:
+                                    job_time = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+                            else:
+                                job_time = datetime.now() - timedelta(days=8)
+                            
                             if current_time - job_time < timedelta(days=7):
                                 valid_jobs[job_url] = timestamp
-                        except (ValueError, TypeError):
-                            # If timestamp is invalid, keep the job but update timestamp later
+                            else:
+                                removed_count += 1
+                        except (ValueError, TypeError, AttributeError):
+                            # Keep if timestamp is unparseable
                             valid_jobs[job_url] = timestamp
                     
-                    # Update cache
-                    _posted_jobs_cache = valid_jobs
-                    _last_cache_update = datetime.now()
+                    if removed_count > 0:
+                        log(f"🧹 Removed {removed_count} old jobs (>7 days)")
                     
-                    log(f"📂 Loaded {len(valid_jobs)} jobs from GitHub Gist")
+                    _posted_jobs_cache = valid_jobs
+                    log(f"📂 Loaded {len(valid_jobs)} jobs from Gist")
                     return valid_jobs.copy()
-            else:
-                log("📁 posted_jobs.json not found in Gist, starting fresh")
-                _posted_jobs_cache = {}
-                _last_cache_update = datetime.now()
-                return {}
+            
+            log("📁 Empty or new Gist, starting fresh")
+            _posted_jobs_cache = {}
+            return {}
         else:
-            log(f"⚠️ Gist load failed: {response.status_code} - {response.text[:200]}")
-            return _posted_jobs_cache.copy() if _posted_jobs_cache else {}
+            log(f"⚠️ Gist load failed: {response.status_code}")
+            return {} if _posted_jobs_cache is None else _posted_jobs_cache.copy()
             
     except Exception as e:
-        log(f"❌ Error loading from Gist: {str(e)}")
-        return _posted_jobs_cache.copy() if _posted_jobs_cache else {}
+        log(f"❌ Error loading Gist: {str(e)}")
+        return {} if _posted_jobs_cache is None else _posted_jobs_cache.copy()
 
 def save_posted_jobs(posted_jobs):
-    """Save all posted jobs to GitHub Gist ONLY and update cache"""
-    global _posted_jobs_cache, _last_cache_update
+    """Save all posted jobs to GitHub Gist and update cache"""
+    global _posted_jobs_cache
     
-    if not GIST_TOKEN:
-        log("❌ GIST_TOKEN not set! Cannot save jobs.")
-        return False
-    
-    if not GIST_ID:
-        log("❌ GIST_ID not set! Cannot save jobs.")
+    if not GIST_TOKEN or not GIST_ID:
+        log("❌ GIST_TOKEN or GIST_ID not set!")
         return False
     
     try:
@@ -131,7 +132,7 @@ def save_posted_jobs(posted_jobs):
             "Accept": "application/vnd.github.v3+json"
         }
         
-        # First, get current gist to preserve other files
+        # Get current gist to preserve other files
         get_response = requests.get(gist_url, headers=headers, timeout=15)
         current_files = {}
         
@@ -139,188 +140,315 @@ def save_posted_jobs(posted_jobs):
             current_data = get_response.json()
             current_files = current_data.get("files", {})
         
-        # Prepare files for update
+        # Prepare files (preserve non-job files)
         files_data = {}
-        
-        # Copy existing files (if any)
-        for filename in current_files:
+        for filename, file_info in current_files.items():
             if filename != "posted_jobs.json":
-                files_data[filename] = {"content": current_files[filename]["content"]}
+                files_data[filename] = {"content": file_info.get("content", "")}
         
-        # Add/update posted_jobs.json
-        files_data["posted_jobs.json"] = {
-            "content": json.dumps(posted_jobs, indent=2, ensure_ascii=False)
-        }
+        # Sort jobs by timestamp (newest first) for readability
+        sorted_jobs = dict(sorted(
+            posted_jobs.items(),
+            key=lambda x: str(x[1]),
+            reverse=True
+        ))
+        
+        # Add/update posted_jobs.json with explicit UTF-8 encoding
+        json_content = json.dumps(sorted_jobs, indent=2, ensure_ascii=False)
+        files_data["posted_jobs.json"] = {"content": json_content}
         
         data = {"files": files_data}
         
-        log(f"📤 Saving to Gist: {len(posted_jobs)} jobs")
+        log(f"💾 Saving {len(posted_jobs)} jobs to Gist...")
         response = requests.patch(gist_url, json=data, headers=headers, timeout=15)
         
         if response.status_code == 200:
-            # Update cache after successful save
             _posted_jobs_cache = posted_jobs.copy()
-            _last_cache_update = datetime.now()
-            
-            log(f"✅ Successfully saved to GitHub Gist")
-            log(f"🔗 View at: https://gist.github.com/{GIST_ID}")
+            log(f"✅ Saved to Gist successfully")
             return True
         else:
-            log(f"❌ Gist save failed: {response.status_code} - {response.text[:200]}")
+            log(f"❌ Gist save failed: {response.status_code}")
+            log(f"   Response: {response.text[:300]}")
             return False
             
     except Exception as e:
-        log(f"❌ Error saving to Gist: {str(e)}")
+        log(f"❌ Error saving Gist: {str(e)}")
+        traceback.print_exc()
         return False
 
 def save_posted_job(job_url):
-    """Save a single posted job URL with timestamp to Gist"""
-    # Load with force refresh to get latest data
+    """Save a single posted job URL with timestamp to Gist - with retry"""
+    # Force refresh to get latest data (avoid conflicts)
     posted_jobs = load_posted_jobs(force_refresh=True)
     
-    # Check if already exists (double-check)
+    # Double-check not already exists
     if job_url in posted_jobs:
-        log(f"⚠️ Job {extract_job_id(job_url)} already exists in Gist, skipping save")
-        return True
-    
-    posted_jobs[job_url] = datetime.now().isoformat()
-    success = save_posted_jobs(posted_jobs)
-    if success:
         job_id = extract_job_id(job_url)
-        log(f"💾 Saved job to Gist: {job_id}")
-    return success
+        log(f"⚠️ Job {job_id} already exists, skipping save")
+        return True, False  # Success, but not new
+    
+    # Add with current timestamp
+    posted_jobs[job_url] = datetime.now().isoformat()
+    
+    # Retry once on failure
+    success = save_posted_jobs(posted_jobs)
+    if not success:
+        log("🔄 Retrying save...")
+        time.sleep(1)
+        success = save_posted_jobs(posted_jobs)
+    
+    job_id = extract_job_id(job_url)
+    log(f"💾 Saved job {job_id} to Gist")
+    return success, True  # Success, and was new
 
 def is_job_posted(job_url):
-    """Check if job has been posted before using URL"""
-    # Use cache but don't force refresh for performance
+    """Check if job has been posted before using Gist (with cache refresh if needed)"""
     posted_jobs = load_posted_jobs(force_refresh=False)
-    result = job_url in posted_jobs
-    if result:
+    
+    if job_url in posted_jobs:
         job_id = extract_job_id(job_url)
-        log(f"🔍 Job {job_id} found in posted jobs")
-    return result
+        return True
+    
+    # If not in cache, double-check with fresh Gist load
+    # This handles the case where another instance posted while we were running
+    posted_jobs = load_posted_jobs(force_refresh=True)
+    
+    return job_url in posted_jobs
 
 # ====================================
-# HELPER FUNCTION
+# HELPER FUNCTIONS
 # ====================================
 def clean_text(text):
-    return ' '.join(text.split()) if text else ""
+    """Clean and normalize text"""
+    if not text:
+        return ""
+    # Remove extra whitespace and normalize
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
 
 def extract_job_id(url):
+    """Extract numeric job ID from URL"""
     match = re.search(r'/(\d+)', url)
-    return f"#{match.group(1)}" if match else ""
+    return f"#{match.group(1)}" if match else url[-20:-1] if len(url) > 20 else url
 
-def format_deadline(date_text):
-    if date_text and date_text not in ["N/A", "Apply Now"]:
-        return f"⏰ {date_text}"
-    return "⚡ ፈጣን ማመልከቻ"
+def format_deadline(deadline_text):
+    """Format deadline with appropriate emoji"""
+    if not deadline_text or deadline_text in ["N/A", "Apply Now", ""]:
+        return "⏰ ፈጣን ማመልከቻ / Apply Soon"
+    
+    # Try to extract date
+    date_patterns = [
+        r'(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})',
+        r'(\d{4})-(\d{2})-(\d{2})',
+        r'(\d{2})/(\d{2})/(\d{4})',
+    ]
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, deadline_text)
+        if match:
+            try:
+                # Calculate days remaining (simplified)
+                return f"⏰ {deadline_text}"
+            except:
+                pass
+    
+    return f"⏰ {deadline_text}"
+
+def get_urgency_indicator(deadline_text):
+    """Get urgency emoji based on deadline"""
+    if not deadline_text:
+        return "🟢"
+    
+    today = datetime.now().date()
+    try:
+        # Try common date formats
+        for fmt in ["%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y"]:
+            try:
+                deadline_date = datetime.strptime(deadline_text.strip(), fmt).date()
+                days_left = (deadline_date - today).days
+                if days_left < 0:
+                    return "⚫"  # Expired
+                elif days_left <= 2:
+                    return "🔴"  # Urgent
+                elif days_left <= 5:
+                    return "🟠"  # Soon
+                elif days_left <= 10:
+                    return "🟡"  # Upcoming
+                else:
+                    return "🟢"  # Plenty of time
+            except ValueError:
+                continue
+    except:
+        pass
+    
+    return "🟢"
+
+def format_job_type(job_type):
+    """Format job type with emoji"""
+    if not job_type or job_type == "N/A":
+        return "💼 ሙሉ ጊዜ / Full-time"
+    
+    job_type_lower = job_type.lower()
+    if "full" in job_type_lower or "permanent" in job_type_lower:
+        return f"💼 {job_type} / Full-time"
+    elif "part" in job_type_lower:
+        return f"⏳ {job_type} / Part-time"
+    elif "contract" in job_type_lower:
+        return f"📋 {job_type} / Contract"
+    elif "intern" in job_type_lower:
+        return f"🎓 {job_type} / Internship"
+    elif "freelance" in job_type_lower:
+        return f"🌐 {job_type} / Freelance"
+    elif "remote" in job_type_lower:
+        return f"🏠 {job_type} / Remote"
+    else:
+        return f"💼 {job_type}"
+
+def format_location(location):
+    """Format location with emoji"""
+    if not location or location == "N/A":
+        return "📍 Addis Ababa, Ethiopia"
+    
+    # Check if it's remote
+    if "remote" in location.lower():
+        return f"🏠 {location} / Remote Work"
+    
+    return f"📍 {location}"
+
+def truncate_text(text, max_words=25):
+    """Truncate text to max words with ellipsis"""
+    if not text:
+        return ""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return ' '.join(words[:max_words]) + "..."
 
 # ====================================
-# SCRAPE JOB DETAIL 
+# SCRAPE JOB DETAIL
 # ====================================
 def scrape_job_detail(job_url):
+    """Scrape detailed information for a single job"""
     try:
-        log(f"➡ Visiting: {job_url}")
+        log(f"🔍 Scraping: {job_url[-50:]}")
+        job_id = extract_job_id(job_url)
 
         response = requests.get(job_url, headers=HEADERS, timeout=15)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
         # ============ TITLE ============
-        title_tag = soup.find("h1", id="jobTitle")
-        title = title_tag.get_text(strip=True) if title_tag else "N/A"
+        title_tag = soup.find("h1", id="jobTitle") or soup.find("h1", class_=re.compile("job|title", re.I))
+        title = clean_text(title_tag.get_text()) if title_tag else "የስራ ማስታወቂያ / Job Posting"
 
         # ============ BASIC INFO ============
         job_type = "N/A"
         location = "N/A"
         deadline = "N/A"
 
-        for h5 in soup.find_all("h5"):
-            strong = h5.find("strong")
-            if not strong:
-                continue
-            label = strong.get_text(strip=True)
+        # Try multiple selectors
+        info_selectors = [
+            ("h5", "strong"),
+            ("div", "strong"),
+            ("p", "strong"),
+            ("li", None),
+        ]
+        
+        for tag, sub_tag in info_selectors:
+            for element in soup.find_all(tag):
+                label_elem = element.find(sub_tag) if sub_tag else element
+                if not label_elem:
+                    continue
+                    
+                label = clean_text(label_elem.get_text())
+                if not label:
+                    continue
 
-            if "Employment:" in label:
-                job_type = h5.get_text(" ", strip=True).replace("Employment:", "").strip()
-            elif "Place of Work:" in label:
-                location = h5.get_text(" ", strip=True).replace("Place of Work:", "").strip()
-            elif "Deadline:" in label:
-                deadline = h5.get_text(" ", strip=True).replace("Deadline:", "").strip()
+                if "Employment" in label or "Job Type" in label:
+                    job_type = clean_text(element.get_text().replace("Employment:", "").replace("Job Type:", ""))
+                elif "Place of Work" in label or "Location" in label:
+                    location = clean_text(element.get_text().replace("Place of Work:", "").replace("Location:", ""))
+                elif "Deadline" in label or "Closing" in label:
+                    deadline = clean_text(element.get_text().replace("Deadline:", "").replace("Closing Date:", ""))
 
         # ============ JOB DESCRIPTION ============
-        all_sections = []
-        job_content = soup.find("div", class_="job-description") or soup.find("article") or soup.find("main")
+        description_sections = []
+        
+        # Find main content area
+        content_selectors = [
+            ("div", {"class": re.compile("job-description|jobdetail|content", re.I)}),
+            ("article", {}),
+            ("main", {}),
+            ("div", {"class": re.compile("entry-content|post-content", re.I)}),
+        ]
+        
+        job_content = None
+        for tag, attrs in content_selectors:
+            job_content = soup.find(tag, attrs) if attrs else soup.find(tag)
+            if job_content:
+                break
+        
+        if not job_content:
+            job_content = soup.find("body")
         
         if job_content:
-            current_section = None
-            current_content = []
+            # Extract structured content
+            headers = job_content.find_all(["h2", "h3", "h4", "h5"])
             
-            for element in job_content.find_all(["p"]):
-                if element.name in ["h2", "h3", "h4", "h5"]:
-                    header_text = element.get_text(strip=True)
+            for header in headers[:4]:  # Limit sections
+                section_title = clean_text(header.get_text())
+                if not section_title or len(section_title) > 100:
+                    continue
                     
-                    if current_section and current_content:
-                        section_text = "\n".join(current_content)
-                        words = section_text.split()
-                        if len(words) > 20:
-                            section_text = ' '.join(words[:20]) + "..."
-                        all_sections.append(f"<b>{current_section}</b>\n{section_text}")
+                # Get content until next header or limit
+                content_parts = []
+                next_elem = header.find_next_sibling()
+                word_count = 0
+                
+                while next_elem and next_elem.name not in ["h2", "h3", "h4", "h5"]:
+                    if next_elem.name in ["p", "li", "div"]:
+                        text = clean_text(next_elem.get_text())
+                        if text and len(text) > 15:
+                            prefix = "• " if next_elem.name == "li" else ""
+                            content_parts.append(prefix + text)
+                            word_count += len(text.split())
                     
-                    current_section = header_text
-                    current_content = []
+                    if word_count >= 40:  # Limit words per section
+                        break
+                    next_elem = next_elem.find_next_sibling()
                 
-                elif element.name in ["p", "li"] and current_section:
-                    text = element.get_text(" ", strip=True)
-                    if text and len(text) > 5:
-                        if element.name == "li":
-                            text = f"• {text}"
-                        current_content.append(text)
+                if content_parts:
+                    section_text = "\n".join(content_parts)
+                    section_text = truncate_text(section_text, 30)
+                    description_sections.append((section_title, section_text))
+            
+            # Fallback: get paragraphs if no sections
+            if not description_sections:
+                paragraphs = []
+                for p in job_content.find_all(["p", "li"]):
+                    text = clean_text(p.get_text())
+                    if text and len(text) > 30 and "apply" not in text.lower()[:20]:
+                        prefix = "• " if p.name == "li" else ""
+                        paragraphs.append(prefix + text)
+                        if len(paragraphs) >= 4:
+                            break
                 
-                elif element.name == "ul" and current_section:
-                    for li in element.find_all("li"):
-                        text = li.get_text(" ", strip=True)
-                        if text:
-                            current_content.append(f"• {text}")
-            
-            # Add the last section
-            if current_section and current_content:
-                section_text = "\n".join(current_content)
-                words = section_text.split()
-                if len(words) > 20:
-                    section_text = ' '.join(words[:20]) + "..."
-                all_sections.append(f"<b>{current_section}</b>\n{section_text}")
-        
-        # If no sections found, get paragraphs
-        if not all_sections and job_content:
-            paragraphs = []
-            for p in job_content.find_all("p"):
-                text = p.get_text(" ", strip=True)
-                if text and len(text) > 20 and "how to apply" not in text.lower():
-                    paragraphs.append(text[:200])
-            
-            if paragraphs:
-                fallback_text = "\n".join(paragraphs[:5])
-                words = fallback_text.split()
-                if len(words) > 20:
-                    fallback_text = ' '.join(words[:20]) + "..."
-                all_sections.append("<b>Job Description</b>\n" + fallback_text)
-        
-        if all_sections:
-            full_description = "\n\n━━━━━━━━━━━━━━━━━━━━━━\n\n".join(all_sections)
-        else:
-            full_description = "ዝርዝር መረጃ አልተገኘም"
-        
-        job_id = extract_job_id(job_url)
-        log(f"✔ Finished: {title[:30]}... - ID: {job_id}")
+                if paragraphs:
+                    combined = " ".join(paragraphs)
+                    description_sections.append(("ዋና ሀላፊነቶች / Key Responsibilities", truncate_text(combined, 30)))
 
+        log(f"✔ Scraped: {title[:40]}... ({job_id})")
+        
         return {
             "id": job_id,
             "title": title,
             "type": job_type,
             "location": location,
             "deadline": deadline,
-            "detail": full_description,
-            "link": job_url
+            "deadline_raw": deadline,  # Keep original for urgency check
+            "sections": description_sections,
+            "link": job_url,
+            "scraped_at": datetime.now().isoformat()
         }
 
     except Exception as e:
@@ -328,97 +456,169 @@ def scrape_job_detail(job_url):
         return None
 
 # ====================================
-# SCRAPE JOBS (Multi-threaded with duplicate check)
+# SCRAPE JOBS - WITH PROPER GIST CHECK
 # ====================================
 def scrape_new_jobs():
-    log("🚀 Starting new jobs scrape...")
+    """Scrape new jobs that haven't been posted yet"""
+    log("🚀 Starting job scrape...")
+    print("═" * 60)
 
     try:
+        # Step 1: Load posted jobs from Gist FIRST
+        posted_jobs = load_posted_jobs(force_refresh=True)
+        initial_count = len(posted_jobs)
+        log(f"📊 Jobs already in Gist: {initial_count}")
+
+        # Step 2: Fetch job listings
         response = requests.get(URL, headers=HEADERS, timeout=15)
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
+        # Extract job links
         job_links = []
-        for a in soup.find_all("a", class_="color-green"):
-            href = a.get("href")
-            if href:
-                if href.startswith("http"):
-                    job_links.append(href)
-                else:
-                    job_links.append(BASE_URL + href)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/job/" in href or "job-detail" in href or re.search(r'/\d{4,}/', href):
+                full_url = href if href.startswith("http") else BASE_URL + href
+                # Deduplicate
+                if full_url not in job_links:
+                    job_links.append(full_url)
 
-        log(f"🔎 Found {len(job_links)} total jobs")
+        log(f"🔎 Found {len(job_links)} total jobs on site")
 
-        # Force refresh posted jobs before checking
-        posted_jobs = load_posted_jobs(force_refresh=True)
+        # Step 3: Filter against Gist (the critical check)
+        new_links = []
+        already_posted = 0
         
-        # Filter out already posted jobs
-        new_job_links = []
-        skipped_count = 0
-        for link in job_links[:15]:  # Limit to 15 jobs per cycle
-            if link not in posted_jobs:
-                new_job_links.append(link)
+        # Normalize URLs for comparison
+        posted_urls_normalized = {url.rstrip('/').split('?')[0] for url in posted_jobs.keys()}
+        
+        for link in job_links[:20]:  # Check top 20
+            normalized = link.rstrip('/').split('?')[0]
+            if normalized not in posted_urls_normalized and link not in posted_jobs:
+                new_links.append(link)
             else:
-                skipped_count += 1
+                already_posted += 1
                 job_id = extract_job_id(link)
-                log(f"⏭ Skipping already posted job {job_id}")
+                log(f"⏭ Already posted: {job_id}")
 
-        log(f"🆕 Found {len(new_job_links)} new jobs to post")
-        log(f"⏭ Skipped {skipped_count} already posted jobs")
+        log(f"🆕 New jobs to scrape: {len(new_links)}")
+        log(f"⏭ Skipped (already posted): {already_posted}")
 
-        if not new_job_links:
+        if not new_links:
             log("📭 No new jobs found")
             return []
 
+        # Step 4: Scrape details with thread pool
         jobs = []
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:10]]  # Limit to 10
+            futures = {executor.submit(scrape_job_detail, link): link for link in new_links[:12]}
+            
             for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    # Double-check if job was posted while we were scraping
-                    if not is_job_posted(result['link']):
-                        jobs.append(result)
-                    else:
-                        log(f"⏭ Job {result['id']} was posted while scraping, skipping")
+                link = futures[future]
+                try:
+                    job_data = future.result()
+                    if job_data:
+                        # FINAL CHECK: Verify not posted during scrape
+                        if not is_job_posted(link):
+                            jobs.append(job_data)
+                        else:
+                            log(f"⏭ Race condition: {job_data['id']} was posted during scrape")
+                except Exception as e:
+                    log(f"❌ Failed to scrape {link}: {str(e)}")
 
-        log(f"🎉 Scraped {len(jobs)} new jobs successfully")
+        log(f"🎉 Successfully scraped {len(jobs)} new jobs")
         return jobs
 
     except Exception as e:
-        log(f"❌ Error fetching job list: {str(e)}")
+        log(f"❌ Error in scrape_new_jobs: {str(e)}")
+        traceback.print_exc()
         return []
 
 # ====================================
-# TELEGRAM POST FUNCTION
+# BEAUTIFUL TELEGRAM POST
 # ====================================
 async def post_job(bot, job):
+    """Post a job to Telegram with beautiful formatting"""
     try:
+        # Format components
+        urgency = get_urgency_indicator(job.get('deadline_raw', ''))
+        job_type_formatted = format_job_type(job['type'])
+        location_formatted = format_location(job['location'])
         deadline_formatted = format_deadline(job['deadline'])
         
+        # Build description sections
+        description_text = ""
+        if job.get('sections'):
+            section_parts = []
+            for title, content in job['sections'][:2]:  # Max 2 sections
+                section_parts.append(f"<b>📌 {title}</b>\n{content}")
+            description_text = "\n\n".join(section_parts)
+        else:
+            description_text = "📋 ተጨማሪ ዝርዝር ለማየት ከታች ያለውን ሊንክ ይጫኑ\n<i>See more details via link below</i>"
+
+        # Beautiful message template
         message = f"""
-💼  የኢትዮጵያ የስራ ማስታወቂያ  💼
-     
-━━━━━━━━━━━━━━━━━━━━━━
-<b>{job['title'].upper()}</b>
-━━━━━━━━━━━━━━━━━━━━━━
-🏢 <b>የስራው አይነት:</b> {job['type']}
-🗺 <b>የስራው ቦታ:</b> {job['location']}
-⏳ <b>የማመልከቻ ማብቂያ ቀን:</b> {deadline_formatted}
-━━━━━━━━━━━━━━━━━━━━━━
-📎 <b>ማስፈንጠሪያ:</b> {job['link']}
-━━━━━━━━━━━━━━━━━━━━━━
-{job['detail']}
-━━━━━━━━━━━━━━━━━━━━━━
-🔔 ማሳሰቢያ: ዛሬ ያመልክቱ! ነገ አይዘገዩ!
+╔═══════════════════════════════════════╗
+║   🇪🇹  <b>የኢትዮጵያ የስራ ማስታወቂያ</b>      ║
+║   <b>ETHIOPIAN JOB ALERT</b>          ║
+╚═══════════════════════════════════════╝
+
+{urgency} <b>{job['title'].upper()}</b>
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  📋 <b>ዝርዝር እይታ / JOB DETAILS</b>
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+🏢 <b>የስራው አይነት</b>
+   ├ {job_type_formatted}
+
+🗺 <b>የስራው ቦታ</b>
+   ├ {location_formatted}
+
+⏳ <b>የማመልከቻ ማብቂያ ቀን</b>
+   ├ {deadline_formatted}
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  📝 <b>ዋና መረጃ / SUMMARY</b>
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+{description_text}
+
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃  🔗 <b>ለማመልከት / HOW TO APPLY</b>
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+
+👉 <a href="{job['link']}">እዚህ ይጫኑ / Click Here to Apply</a>
+   <code>{job['link'][:60]}...</code>
+
+• • • • • • • • • • • • • • • • • • • •
+🔔 <b>ማሳሰቢያ:</b> ዛሬ ያመልክቱ! ነገ አይዘገዩ!
+   <i>Apply today! Don't delay!</i>
+
+📌 <b>ተጨማሪ ስራዎች:</b> @trytry1221
+   <i>More jobs on our channel</i>
+
+🆔 <code>Job ID: {job['id']}</code>
+⏰ Posted: {datetime.now().strftime('%b %d, %Y %H:%M')}
 """
 
-        # Create buttons
+        # Attractive buttons
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 አመልክት / APPLY", url=job["link"])],
-            [InlineKeyboardButton("📢 ሌሎች ስራዎች", url="https://t.me/trytry1221")]
+            [
+                InlineKeyboardButton("📝 አመልክት / APPLY NOW", url=job["link"]),
+            ],
+            [
+                InlineKeyboardButton("🔔 ቻናላችንን ይቀላቀሉ / Join Channel", url="https://t.me/trytry1221"),
+                InlineKeyboardButton("📢 ለጓደኛ ያጋሩ / Share", url=f"https://t.me/share/url?url={quote(job['link'])}&text={quote('Check out this job: ' + job['title'])}"),
+            ],
+            [
+                InlineKeyboardButton("🌐 ድህረገፃችን / Website", url=BASE_URL),
+            ]
         ])
 
-        await bot.send_message(
+        # Send message
+        sent_msg = await bot.send_message(
             chat_id=CHANNEL_ID,
             text=message,
             parse_mode="HTML",
@@ -426,150 +626,172 @@ async def post_job(bot, job):
             disable_web_page_preview=False
         )
         
-        # Save the posted job to Gist
-        save_posted_job(job['link'])
+        # CRITICAL: Save to Gist AFTER successful post
+        save_success, was_new = save_posted_job(job['link'])
         
-        log(f"✅ Posted: {job['title'][:50]}...")
-        return True
+        if save_success:
+            log(f"✅ Posted & saved: {job['title'][:45]}... (Msg ID: {sent_msg.message_id})")
+        else:
+            log(f"⚠️ Posted but Gist save failed: {job['id']}")
+        
+        return save_success or was_new  # Return True if posted successfully
         
     except TelegramError as e:
-        log(f"❌ Telegram error: {str(e)}")
+        log(f"❌ Telegram error posting {job.get('id', 'unknown')}: {str(e)}")
         return False
     except Exception as e:
-        log(f"❌ Error posting: {str(e)}")
+        log(f"❌ Error posting {job.get('id', 'unknown')}: {str(e)}")
+        traceback.print_exc()
         return False
 
 # ====================================
 # JOB POSTING CYCLE
 # ====================================
 async def job_posting_cycle(bot):
-    """One complete cycle of scraping and posting"""
-    print("\n" + "═"*60)
-    print(f"     📊 አዲስ የስራ ማስታወቂያ ዑደት")
-    print(f"     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("═"*60)
-    
-    log("📡 Fetching job listings...")
+    """Complete cycle: scrape and post new jobs"""
+    cycle_start = datetime.now()
+    print("\n" + "╔" + "═" * 58 + "╗")
+    print("║" + f"{'📊 NEW JOB POSTING CYCLE':^58}" + "║")
+    print("║" + f"{cycle_start.strftime('%Y-%m-%d %H:%M:%S'):^58}" + "║")
+    print("╚" + "═" * 58 + "╝")
+
+    # Scrape new jobs
+    log("📡 Fetching fresh job listings...")
     new_jobs = scrape_new_jobs()
-    
+
     if not new_jobs:
-        log("📭 No new jobs found")
-        print("═"*60 + "\n")
-        return
-    
-    print("\n" + "═"*60)
-    print(f"     🚀 Posting {len(new_jobs)} new jobs...")
-    print("═"*60 + "\n")
-    
-    posted_count = 0
-    for index, job in enumerate(new_jobs, 1):
-        log(f"📤 [{index}/{len(new_jobs)}] Posting: {job['title'][:30]}...")
+        print("═" * 60)
+        log("📭 No new jobs to post")
+        print("═" * 60 + "\n")
+        return 0, 0
+
+    # Post jobs
+    print("\n" + "╔" + "═" * 58 + "╗")
+    print("║" + f"{'🚀 POSTING ' + str(len(new_jobs)) + ' NEW JOBS':^58}" + "║")
+    print("╚" + "═" * 58 + "╝\n")
+
+    posted = 0
+    failed = 0
+
+    for i, job in enumerate(new_jobs, 1):
+        progress = f"[{i}/{len(new_jobs)}]"
+        log(f"{progress} Posting: {job['title'][:35]}...")
+        
         success = await post_job(bot, job)
         if success:
-            posted_count += 1
-        
-        if index < len(new_jobs):
-            log(f"⏳ Waiting {DELAY_BETWEEN_POSTS} seconds...\n")
+            posted += 1
+        else:
+            failed += 1
+
+        # Delay between posts (except last)
+        if i < len(new_jobs):
+            log(f"⏳ Waiting {DELAY_BETWEEN_POSTS}s...")
             await asyncio.sleep(DELAY_BETWEEN_POSTS)
-    
-    print("\n" + "═"*60)
-    print(f"     ✅ {posted_count}/{len(new_jobs)} jobs posted successfully!")
-    print("═"*60 + "\n")
+
+    # Summary
+    duration = (datetime.now() - cycle_start).total_seconds()
+    print("\n" + "╔" + "═" * 58 + "╗")
+    print("║" + f"{'✅ CYCLE COMPLETE':^58}" + "║")
+    print("║" + f"{'Posted: ' + str(posted) + ' | Failed: ' + str(failed):^58}" + "║")
+    print("║" + f"{'Duration: ' + str(int(duration)) + 's':^58}" + "║")
+    print("╚" + "═" * 58 + "╝\n")
+
+    # Verify final count
+    final_jobs = load_posted_jobs(force_refresh=True)
+    log(f"📊 Total jobs in Gist now: {len(final_jobs)}")
+
+    return posted, failed
 
 # ====================================
-# MAIN - CRON VERSION WITH DEBUGGING
+# MAIN
 # ====================================
 async def main():
+    """Main entry point for cron job"""
+    start_time = datetime.now()
+    
+    # Header
     print("""
-    ╔════════════════════════════════════════════╗
-    ║     🇪🇹 የኢትዮጵያ ስራዎች - ክሮን ስሪት         ║
-    ║       ETHIOPIAN JOBS - CRON VERSION       ║
-    ╚════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════╗
+    ║  🇪🇹  የኢትዮጵያ ስራዎች ቦርሳ - ክሮን የስራ ሂደት    ║
+    ║  ETHIOPIAN JOBS BOT - CRON SCHEDULED TASK              ║
+    ╚══════════════════════════════════════════════════════════╝
     """)
-    
-    # ============ DEBUG ENVIRONMENT VARIABLES ============
-    log("🔍 DEBUG: Checking environment variables...")
-    log(f"🔍 DEBUG: BOT_TOKEN exists: {bool(TOKEN)}")
-    log(f"🔍 DEBUG: CHANNEL_ID: {CHANNEL_ID}")
-    log(f"🔍 DEBUG: GIST_TOKEN exists: {bool(GIST_TOKEN)}")
-    log(f"🔍 DEBUG: GIST_ID: {GIST_ID}")
-    
-    # ============ CHECK REQUIRED TOKENS ============
+
+    # Debug environment
+    log("🔍 Environment check...")
+    env_status = {
+        "BOT_TOKEN": "✅ Set" if TOKEN else "❌ Missing",
+        "CHANNEL_ID": CHANNEL_ID,
+        "GIST_TOKEN": "✅ Set" if GIST_TOKEN else "❌ Missing", 
+        "GIST_ID": "✅ Set" if GIST_ID else "❌ Missing",
+    }
+    for key, val in env_status.items():
+        log(f"   {key}: {val}")
+
+    # Validate required config
+    missing = []
     if not TOKEN:
-        log("❌ BOT_TOKEN environment variable not set!")
-        return
-    
+        missing.append("BOT_TOKEN")
     if not GIST_TOKEN:
-        log("❌ GIST_TOKEN environment variable not set! Gist storage required.")
-        return
-    
+        missing.append("GIST_TOKEN")
     if not GIST_ID:
-        log("❌ GIST_ID environment variable not set! Gist storage required.")
-        return
+        missing.append("GIST_ID")
     
-    # ============ TEST GITHUB GIST ACCESS ============
-    try:
-        # First, load existing jobs to see what's there
-        existing_jobs = load_posted_jobs(force_refresh=True)
-        log(f"📊 Current jobs in Gist: {len(existing_jobs)}")
-        
-        # Show a sample of existing jobs
-        if existing_jobs:
-            sample_jobs = list(existing_jobs.items())[:3]
-            log("📋 Sample of existing jobs:")
-            for url, timestamp in sample_jobs:
-                job_id = extract_job_id(url)
-                log(f"   {job_id}: {timestamp}")
-        
-        log("✅ GitHub Gist access confirmed")
-    except Exception as e:
-        log(f"❌ GitHub Gist access failed: {str(e)}")
-        log("🔍 Make sure your GIST_TOKEN has 'gist' scope and GIST_ID is correct")
-        return
-    
-    # ============ TEST BOT CONNECTION ============
+    if missing:
+        log(f"❌ Missing required: {', '.join(missing)}")
+        return 1
+
+    # Initialize bot
     try:
         bot = Bot(token=TOKEN)
         me = await bot.get_me()
-        log(f"✅ Bot connected successfully: @{me.username} (ID: {me.id})")
+        log(f"🤖 Bot: @{me.username} (ID: {me.id})")
     except Exception as e:
         log(f"❌ Bot connection failed: {str(e)}")
-        log(f"🔍 Traceback: {traceback.format_exc()}")
-        return
-    
-    # ============ TEST CHANNEL ACCESS ============
+        return 1
+
+    # Test Gist access
     try:
-        test_message = await bot.send_message(
+        test_jobs = load_posted_jobs(force_refresh=True)
+        log(f"📁 Gist access OK: {len(test_jobs)} existing jobs")
+    except Exception as e:
+        log(f"❌ Gist access failed: {str(e)}")
+        return 1
+
+    # Test channel access
+    try:
+        test_msg = await bot.send_message(
             chat_id=CHANNEL_ID,
-            text=f"🔧 Test message from cron job - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nIf you see this, the bot can post to the channel!\n\n📁 Using Gist storage: {GIST_ID}\n📊 Jobs in database: {len(existing_jobs) if 'existing_jobs' in locals() else 'unknown'}",
+            text=f"🔧 <b>Cron Test</b> - {start_time.strftime('%H:%M:%S')}\n✅ Bot & Gist operational",
             parse_mode="HTML"
         )
-        log(f"✅ Successfully sent test message to channel (Message ID: {test_message.message_id})")
+        await bot.delete_message(chat_id=CHANNEL_ID, message_id=test_msg.message_id)
+        log(f"📢 Channel access OK: {CHANNEL_ID}")
     except Exception as e:
-        log(f"❌ Cannot send to channel: {str(e)}")
-        log(f"🔍 Make sure the bot is an admin in {CHANNEL_ID}")
-        log(f"🔍 Traceback: {traceback.format_exc()}")
-        return
+        log(f"❌ Channel access failed: {str(e)}")
+        log("   Ensure bot is admin with post permissions")
+        return 1
+
+    print("═" * 60)
     
-    log(f"📋 Channel: {CHANNEL_ID}")
-    log(f"📁 Using GitHub Gist for storage: https://gist.github.com/{GIST_ID}")
+    # Run main cycle
+    posted, failed = await job_posting_cycle(bot)
     
-    print("═"*60 + "\n")
-    
-    # ============ RUN ONE POSTING CYCLE ============
-    await job_posting_cycle(bot)
-    
-    # ============ VERIFY AFTER POSTING ============
-    final_jobs = load_posted_jobs(force_refresh=True)
-    log(f"📊 Final jobs in Gist after cycle: {len(final_jobs)}")
-    
-    log(f"✅ Cycle completed - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Footer
+    total_time = (datetime.now() - start_time).total_seconds()
+    log(f"🏁 Total runtime: {total_time:.1f}s")
+    log(f"📊 Jobs posted this run: {posted}")
+
+    return 0 if failed == 0 else 1
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        exit_code = asyncio.run(main())
+        exit(exit_code)
     except KeyboardInterrupt:
-        log("\n⚠️ Program stopped by user")
+        log("\n⚠️ Interrupted by user")
+        exit(130)
     except Exception as e:
-        log(f"\n❌ Fatal error: {str(e)}")
+        log(f"\n💥 Fatal error: {str(e)}")
         traceback.print_exc()
+        exit(1)

@@ -2,7 +2,7 @@ services:
   - type: cron
     name: ethiopian-jobs-bot
     runtime: python
-    schedule: "*/5 * * * *"  # Runs every 5 minutes
+    schedule: "*/50 * * * *"  # Runs every 5 minutes
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt

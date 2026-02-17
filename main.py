@@ -15,7 +15,7 @@ import traceback
 TOKEN = "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w"
 CHANNEL_ID = "@trytry12211"
 DELAY_BETWEEN_POSTS = 1
-SCRAPE_INTERVAL = 60  # 30 seconds
+SCRAPE_INTERVAL = 7200  # 2 hours in seconds (7200)
 
 # Local file for storing posted jobs (works on Render)
 DATA_FILE = "posted_jobs.json"
@@ -80,7 +80,7 @@ def save_posted_jobs(posted_jobs):
         return False
 
 # ====================================
-# HELPER FUNCTION
+# HELPER FUNCTIONS
 # ====================================
 def clean_text(text):
     return ' '.join(text.split()) if text else ""
@@ -93,6 +93,28 @@ def format_deadline(date_text):
     if date_text and date_text not in ["N/A", "Apply Now"]:
         return f"⏰ {date_text}"
     return "⚡ ፈጣን ማመልከቻ"
+
+def is_job_valid(job):
+    """Check if job has required fields before posting"""
+    if not job:
+        return False
+    
+    # Check if title is missing or N/A
+    if not job.get('title') or job['title'] == 'N/A' or len(job['title'].strip()) < 3:
+        log(f"❌ Skipping job - Invalid title: {job.get('title', 'None')}")
+        return False
+    
+    # Check if job type is missing or N/A
+    if not job.get('type') or job['type'] == 'N/A' or len(job['type'].strip()) < 2:
+        log(f"❌ Skipping job - Invalid job type for: {job.get('title', 'Unknown')}")
+        return False
+    
+    # Check if location is missing or N/A
+    if not job.get('location') or job['location'] == 'N/A':
+        log(f"❌ Skipping job - Invalid location for: {job.get('title', 'Unknown')}")
+        return False
+    
+    return True
 
 # ====================================
 # SCRAPE JOB DETAIL 
@@ -182,9 +204,8 @@ def scrape_job_detail(job_url):
             full_description = "ዝርዝር መረጃ አልተገኘም"
         
         job_id = extract_job_id(job_url)
-        log(f"✔ Finished: {title[:30]}... - ID: {job_id}")
-
-        return {
+        
+        job_data = {
             "id": job_id,
             "title": title,
             "type": job_type,
@@ -193,6 +214,14 @@ def scrape_job_detail(job_url):
             "detail": full_description,
             "link": job_url
         }
+        
+        # Validate job before returning
+        if is_job_valid(job_data):
+            log(f"✔ Valid job: {title[:30]}... - ID: {job_id}")
+            return job_data
+        else:
+            log(f"✖ Invalid job skipped: {title[:30]}... - ID: {job_id}")
+            return None
 
     except Exception as e:
         log(f"❌ Error scraping {job_url}: {str(e)}")
@@ -223,7 +252,7 @@ def scrape_new_jobs(posted_jobs):
         # Filter out already posted jobs
         new_job_links = []
         skipped_count = 0
-        for link in job_links[:15]:  # Limit to 15 jobs per cycle
+        for link in job_links[:20]:  # Increased to 20 jobs per cycle to account for invalid ones
             if link not in posted_jobs:
                 new_job_links.append(link)
             else:
@@ -231,7 +260,7 @@ def scrape_new_jobs(posted_jobs):
                 job_id = extract_job_id(link)
                 log(f"⏭ Skipping already posted job {job_id}")
 
-        log(f"🆕 Found {len(new_job_links)} new jobs to post")
+        log(f"🆕 Found {len(new_job_links)} new jobs to check")
         log(f"⏭ Skipped {skipped_count} already posted jobs")
 
         if not new_job_links:
@@ -239,14 +268,20 @@ def scrape_new_jobs(posted_jobs):
             return []
 
         jobs = []
+        invalid_count = 0
+        
         with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:10]]
+            futures = [executor.submit(scrape_job_detail, link) for link in new_job_links[:15]]
             for future in as_completed(futures):
                 result = future.result()
                 if result:
                     jobs.append(result)
+                else:
+                    invalid_count += 1
 
-        log(f"🎉 Scraped {len(jobs)} new jobs successfully")
+        log(f"🎉 Scraped {len(jobs)} valid jobs successfully")
+        log(f"✖ Skipped {invalid_count} invalid jobs (missing title/type/location)")
+        
         return jobs
 
     except Exception as e:
@@ -322,12 +357,12 @@ async def job_posting_cycle(bot):
     new_jobs = scrape_new_jobs(posted_jobs)
     
     if not new_jobs:
-        log("📭 No new jobs found")
+        log("📭 No valid new jobs found")
         print("═"*60 + "\n")
         return
     
     print("\n" + "═"*60)
-    print(f"     🚀 Posting {len(new_jobs)} new jobs...")
+    print(f"     🚀 Posting {len(new_jobs)} valid jobs...")
     print("═"*60 + "\n")
     
     posted_count = 0
@@ -361,7 +396,7 @@ async def main():
     ╔════════════════════════════════════════════╗
     ║     🇪🇹 የኢትዮጵያ ስራዎች - ቀጣይነት ያለው         ║
     ║       ETHIOPIAN JOBS - CONTINUOUS          ║
-    ║         (Every 30 Seconds)                  ║
+    ║         (Every 2 Hours)                     ║
     ╚════════════════════════════════════════════╝
     """)
     
@@ -372,12 +407,19 @@ async def main():
     
     log(f"📋 Channel: {CHANNEL_ID}")
     log(f"📁 Data file: {DATA_FILE}")
-    log(f"⏱️  Checking every {SCRAPE_INTERVAL} seconds")
+    
+    # Convert seconds to hours for display
+    hours = SCRAPE_INTERVAL / 3600
+    log(f"⏱️  Checking every {hours} hour(s) ({SCRAPE_INTERVAL} seconds)")
     print("═"*60 + "\n")
     
     # First run check - show if this is first time
     if len(test_jobs) == 0:
         log("🎉 First time running! Will start posting new jobs...")
+    
+    # Calculate next run time
+    next_run = datetime.now() + timedelta(seconds=SCRAPE_INTERVAL)
+    log(f"⏰ Next check at: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
     
     cycle_count = 0
     while True:
@@ -392,7 +434,10 @@ async def main():
             log(f"❌ Error in cycle: {str(e)}")
             traceback.print_exc()
         
-        log(f"💤 Waiting {SCRAPE_INTERVAL} seconds until next check...")
+        # Calculate next run time
+        next_run = datetime.now() + timedelta(seconds=SCRAPE_INTERVAL)
+        log(f"⏰ Next check at: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"💤 Waiting {SCRAPE_INTERVAL} seconds ({SCRAPE_INTERVAL/3600} hours) until next check...")
         print(f"{'='*60}\n")
         await asyncio.sleep(SCRAPE_INTERVAL)
 

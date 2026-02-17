@@ -17,7 +17,7 @@ import traceback
 TOKEN = "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w"
 CHANNEL_ID = "@trytry1221"
 DELAY_BETWEEN_POSTS = 1
-SCRAPE_INTERVAL = 30  # 30 seconds
+SCRAPE_INTERVAL = 3000  # 30 seconds
 
 # GitHub Gist Config
 GIST_TOKEN = "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"

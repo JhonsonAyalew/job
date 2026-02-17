@@ -1,3 +1,4 @@
+
 import asyncio
 import requests
 from bs4 import BeautifulSoup
@@ -7,18 +8,20 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
-from urllib.parse import quote
+import time
+import traceback
 
 # ====================================
-# CONFIG - ENVIRONMENT VARIABLES ONLY
+# CONFIG
 # ====================================
-TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "@trytry1221")
-DELAY_BETWEEN_POSTS = 4
+TOKEN = "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w"
+CHANNEL_ID = "@trytry1221"
+DELAY_BETWEEN_POSTS = 1
+SCRAPE_INTERVAL = 30  # 30 seconds
 
-# GitHub Gist Config - REQUIRED
-GIST_TOKEN = os.environ.get("GIST_TOKEN")
-GIST_ID = os.environ.get("GIST_ID", "6de7206ca0a1010314e34e984d8dc78e")
+# GitHub Gist Config
+GIST_TOKEN = "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"
+GIST_ID = "6de7206ca0a1010314e34e984d8dc78e"
 
 BASE_URL = "https://geezjobs.com"
 URL = "https://geezjobs.com/jobs-in-ethiopia"
@@ -35,15 +38,11 @@ def log(message):
     print(f"[{now}] {message}")
 
 # ====================================
-# POSTED JOBS TRACKING - GITHUB GIST ONLY (USING URL)
+# POSTED JOBS TRACKING - GITHUB GIST (USING URL)
 # ====================================
 def load_posted_jobs():
-    """Load previously posted job URLs from GitHub Gist ONLY"""
+    """Load previously posted job URLs from GitHub Gist"""
     posted_jobs = {}
-    
-    if not GIST_TOKEN or not GIST_ID:
-        log("❌ GIST_TOKEN or GIST_ID not set! Cannot load jobs.")
-        return {}
     
     try:
         gist_url = f"https://api.github.com/gists/{GIST_ID}"
@@ -71,7 +70,6 @@ def load_posted_jobs():
                             if current_time - job_time < timedelta(days=7):
                                 valid_jobs[job_url] = timestamp
                         except (ValueError, TypeError):
-                            # If timestamp is invalid, keep the job
                             valid_jobs[job_url] = timestamp
                     
                     log(f"📂 Loaded {len(valid_jobs)} jobs from GitHub Gist")
@@ -88,11 +86,7 @@ def load_posted_jobs():
         return {}
 
 def save_posted_jobs(posted_jobs):
-    """Save all posted jobs to GitHub Gist ONLY"""
-    if not GIST_TOKEN or not GIST_ID:
-        log("❌ GIST_TOKEN or GIST_ID not set! Cannot save jobs.")
-        return False
-    
+    """Save all posted jobs to GitHub Gist"""
     try:
         gist_url = f"https://api.github.com/gists/{GIST_ID}"
         headers = {
@@ -126,7 +120,7 @@ def save_posted_jobs(posted_jobs):
         response = requests.patch(gist_url, json=data, headers=headers, timeout=15)
         
         if response.status_code == 200:
-            log(f"✅ Successfully saved {len(posted_jobs)} jobs to GitHub Gist")
+            log(f"✅ Saved {len(posted_jobs)} jobs to GitHub Gist")
             return True
         else:
             log(f"❌ Gist save failed: {response.status_code}")
@@ -135,17 +129,6 @@ def save_posted_jobs(posted_jobs):
     except Exception as e:
         log(f"❌ Error saving to Gist: {str(e)}")
         return False
-
-def save_posted_job(job_url):
-    """Save a single posted job URL with timestamp to Gist"""
-    posted_jobs = load_posted_jobs()
-    posted_jobs[job_url] = datetime.now().isoformat()
-    return save_posted_jobs(posted_jobs)
-
-def is_job_posted(job_url):
-    """Check if job has been posted before using URL"""
-    posted_jobs = load_posted_jobs()
-    return job_url in posted_jobs
 
 # ====================================
 # HELPER FUNCTION
@@ -267,9 +250,10 @@ def scrape_job_detail(job_url):
         return None
 
 # ====================================
-# SCRAPE JOBS (Multi-threaded with duplicate check)
+# SCRAPE JOBS (with duplicate check using Gist)
 # ====================================
-def scrape_new_jobs():
+def scrape_new_jobs(posted_jobs):
+    """Scrape jobs and filter out already posted ones using the posted_jobs dict"""
     log("🚀 Starting new jobs scrape...")
 
     try:
@@ -291,7 +275,7 @@ def scrape_new_jobs():
         new_job_links = []
         skipped_count = 0
         for link in job_links[:15]:  # Limit to 15 jobs per cycle
-            if not is_job_posted(link):
+            if link not in posted_jobs:  # Check using the dict we loaded
                 new_job_links.append(link)
             else:
                 skipped_count += 1
@@ -328,19 +312,24 @@ async def post_job(bot, job):
         deadline_formatted = format_deadline(job['deadline'])
         
         message = f"""
-💼  የኢትዮጵያ የስራ ማስታወቂያ  💼
+<b>💼  የኢትዮጵያ የስራ ማስታወቂያ  / Ethiopian Jobs 💼</b>
      
 ━━━━━━━━━━━━━━━━━━━━━━
 <b>{job['title'].upper()}</b>
 ━━━━━━━━━━━━━━━━━━━━━━
+
 🏢 <b>የስራው አይነት:</b> {job['type']}
+
 🗺 <b>የስራው ቦታ:</b> {job['location']}
+
 ⏳ <b>የማመልከቻ ማብቂያ ቀን:</b> {deadline_formatted}
+
+📎 <b>አመልክት: </b> <a href="{job['link']}"><b>🔗 Click Here To Apply</b></a>
 ━━━━━━━━━━━━━━━━━━━━━━
-📎 <b>ማስፈንጠሪያ:</b> {job['link']}
-━━━━━━━━━━━━━━━━━━━━━━
+
 {job['detail']}
-━━━━━━━━━━━━━━━━━━━━━━
+
+
 🔔 ማሳሰቢያ: ዛሬ ያመልክቱ! ነገ አይዘገዩ!
 """
 
@@ -357,9 +346,6 @@ async def post_job(bot, job):
             reply_markup=keyboard,
             disable_web_page_preview=False
         )
-        
-        # Save the posted job to Gist using URL
-        save_posted_job(job['link'])
         
         log(f"✅ Posted: {job['title'][:50]}...")
         return True
@@ -378,8 +364,13 @@ async def job_posting_cycle(bot):
     print(f"     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("═"*60)
     
-    log("📡 Fetching job listings...")
-    new_jobs = scrape_new_jobs()
+    # LOAD POSTED JOBS ONCE at the beginning of the cycle
+    log("📡 Loading posted jobs from Gist...")
+    posted_jobs = load_posted_jobs()
+    log(f"📊 Found {len(posted_jobs)} already posted jobs in history")
+    
+    log("📡 Fetching new job listings...")
+    new_jobs = scrape_new_jobs(posted_jobs)  # Pass the posted_jobs dict
     
     if not new_jobs:
         log("📭 No new jobs found")
@@ -391,63 +382,78 @@ async def job_posting_cycle(bot):
     print("═"*60 + "\n")
     
     posted_count = 0
+    # Update posted_jobs dict as we go
     for index, job in enumerate(new_jobs, 1):
         log(f"📤 [{index}/{len(new_jobs)}] Posting: {job['title'][:30]}...")
         success = await post_job(bot, job)
         if success:
             posted_count += 1
+            # Add to posted_jobs dict immediately
+            posted_jobs[job['link']] = datetime.now().isoformat()
         
         if index < len(new_jobs):
             log(f"⏳ Waiting {DELAY_BETWEEN_POSTS} seconds...\n")
             await asyncio.sleep(DELAY_BETWEEN_POSTS)
+    
+    # SAVE ALL POSTED JOBS AT ONCE at the end of the cycle
+    if posted_count > 0:
+        log(f"💾 Saving {posted_count} new jobs to Gist...")
+        save_posted_jobs(posted_jobs)
     
     print("\n" + "═"*60)
     print(f"     ✅ {posted_count}/{len(new_jobs)} jobs posted successfully!")
     print("═"*60 + "\n")
 
 # ====================================
-# MAIN - CRON VERSION (NO TEST MESSAGES)
+# MAIN LOOP - RUNS EVERY 30 SECONDS
 # ====================================
 async def main():
+    bot = Bot(token=TOKEN)
+    
     print("""
     ╔════════════════════════════════════════════╗
-    ║     🇪🇹 የኢትዮጵያ ስራዎች - ክሮን ስሪት         ║
-    ║       ETHIOPIAN JOBS - CRON VERSION       ║
+    ║     🇪🇹 የኢትዮጵያ ስራዎች - ቀጣይነት ያለው         ║
+    ║       ETHIOPIAN JOBS - CONTINUOUS          ║
+    ║         (Every 30 Seconds)                  ║
     ╚════════════════════════════════════════════╝
     """)
     
-    # Check required tokens
-    if not TOKEN:
-        log("❌ BOT_TOKEN environment variable not set!")
-        return
-    
-    if not GIST_TOKEN or not GIST_ID:
-        log("❌ GIST_TOKEN and GIST_ID must be set!")
-        return
-    
-    # Initialize bot
-    try:
-        bot = Bot(token=TOKEN)
-        me = await bot.get_me()
-        log(f"✅ Bot connected: @{me.username}")
-    except Exception as e:
-        log(f"❌ Bot connection failed: {str(e)}")
-        return
+    # Test Gist connection first
+    log("🔍 Testing GitHub Gist connection...")
+    test_jobs = load_posted_jobs()
+    if isinstance(test_jobs, dict):
+        log(f"✅ GitHub Gist connected successfully! Found {len(test_jobs)} jobs in history")
+    else:
+        log("⚠️ GitHub Gist connection issue, but continuing...")
     
     log(f"📋 Channel: {CHANNEL_ID}")
-    log(f"📁 Using GitHub Gist: https://gist.github.com/{GIST_ID}")
-    
+    log(f"📁 GitHub Gist ID: {GIST_ID}")
+    log(f"⏱️  Checking every {SCRAPE_INTERVAL} seconds")
     print("═"*60 + "\n")
     
-    # Run one posting cycle
-    await job_posting_cycle(bot)
-    
-    log(f"✅ Cycle completed - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Run forever
+    cycle_count = 0
+    while True:
+        cycle_count += 1
+        print(f"\n{'='*60}")
+        print(f"🔄 CYCLE #{cycle_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}")
+        
+        try:
+            await job_posting_cycle(bot)
+        except Exception as e:
+            log(f"❌ Error in cycle: {str(e)}")
+            traceback.print_exc()
+        
+        log(f"💤 Waiting {SCRAPE_INTERVAL} seconds until next check...")
+        print(f"{'='*60}\n")
+        await asyncio.sleep(SCRAPE_INTERVAL)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log("\n⚠️ Program stopped by user")
+        print("\n\n⚠️ Program stopped by user")
     except Exception as e:
-        log(f"\n❌ Fatal error: {str(e)}")
+        print(f"\n❌ Fatal error: {str(e)}")
+        traceback.print_exc()

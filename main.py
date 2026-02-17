@@ -1,4 +1,3 @@
-
 import asyncio
 import requests
 from bs4 import BeautifulSoup
@@ -8,20 +7,18 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
-import time
 import traceback
 
 # ====================================
 # CONFIG
 # ====================================
 TOKEN = "8191854029:AAFdBYDf5wqAMXEXEubrzLfmsJubF6icm1w"
-CHANNEL_ID = "@trytry1221"
+CHANNEL_ID = "@trytry12211"
 DELAY_BETWEEN_POSTS = 1
-SCRAPE_INTERVAL = 30000000000  # 30 seconds
+SCRAPE_INTERVAL = 60  # 30 seconds
 
-# GitHub Gist Config
-GIST_TOKEN = "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"
-GIST_ID = "6de7206ca0a1010314e34e984d8dc78e"
+# Local file for storing posted jobs (works on Render)
+DATA_FILE = "posted_jobs.json"
 
 BASE_URL = "https://geezjobs.com"
 URL = "https://geezjobs.com/jobs-in-ethiopia"
@@ -38,96 +35,48 @@ def log(message):
     print(f"[{now}] {message}")
 
 # ====================================
-# POSTED JOBS TRACKING - GITHUB GIST (USING URL)
+# POSTED JOBS TRACKING - LOCAL FILE (FOR RENDER)
 # ====================================
 def load_posted_jobs():
-    """Load previously posted job URLs from GitHub Gist"""
+    """Load previously posted job URLs from local file"""
     posted_jobs = {}
     
     try:
-        gist_url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {
-            "Authorization": f"token {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        response = requests.get(gist_url, headers=headers, timeout=15)
-        
-        if response.status_code == 200:
-            gist_data = response.json()
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
-            if "files" in gist_data and "posted_jobs.json" in gist_data["files"]:
-                content = gist_data["files"]["posted_jobs.json"]["content"]
-                if content.strip():
-                    data = json.loads(content)
-                    
-                    # Clean jobs older than 7 days
-                    current_time = datetime.now()
-                    valid_jobs = {}
-                    for job_url, timestamp in data.items():
-                        try:
-                            job_time = datetime.fromisoformat(timestamp)
-                            if current_time - job_time < timedelta(days=7):
-                                valid_jobs[job_url] = timestamp
-                        except (ValueError, TypeError):
-                            valid_jobs[job_url] = timestamp
-                    
-                    log(f"📂 Loaded {len(valid_jobs)} jobs from GitHub Gist")
-                    return valid_jobs
-            else:
-                log("📁 posted_jobs.json not found in Gist, starting fresh")
-                return {}
+            # Clean jobs older than 7 days
+            current_time = datetime.now()
+            valid_jobs = {}
+            for job_url, timestamp in data.items():
+                try:
+                    job_time = datetime.fromisoformat(timestamp)
+                    if current_time - job_time < timedelta(days=7):
+                        valid_jobs[job_url] = timestamp
+                except (ValueError, TypeError):
+                    # If date is invalid, keep the job but use current time
+                    valid_jobs[job_url] = timestamp
+            
+            log(f"📂 Loaded {len(valid_jobs)} jobs from local file")
+            return valid_jobs
         else:
-            log(f"⚠️ Gist load failed: {response.status_code}")
+            log("📁 No existing data file, starting fresh")
             return {}
             
     except Exception as e:
-        log(f"❌ Error loading from Gist: {str(e)}")
+        log(f"❌ Error loading from file: {str(e)}")
         return {}
 
 def save_posted_jobs(posted_jobs):
-    """Save all posted jobs to GitHub Gist"""
+    """Save all posted jobs to local file"""
     try:
-        gist_url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {
-            "Authorization": f"token {GIST_TOKEN}",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        
-        # First, get current gist to preserve other files
-        get_response = requests.get(gist_url, headers=headers, timeout=15)
-        current_files = {}
-        
-        if get_response.status_code == 200:
-            current_data = get_response.json()
-            current_files = current_data.get("files", {})
-        
-        # Prepare files for update
-        files_data = {}
-        
-        # Copy existing files (if any)
-        for filename in current_files:
-            if filename != "posted_jobs.json":
-                files_data[filename] = {"content": current_files[filename]["content"]}
-        
-        # Add/update posted_jobs.json
-        files_data["posted_jobs.json"] = {
-            "content": json.dumps(posted_jobs, indent=2, ensure_ascii=False)
-        }
-        
-        data = {"files": files_data}
-        
-        response = requests.patch(gist_url, json=data, headers=headers, timeout=15)
-        
-        if response.status_code == 200:
-            log(f"✅ Saved {len(posted_jobs)} jobs to GitHub Gist")
-            return True
-        else:
-            log(f"❌ Gist save failed: {response.status_code}")
-            return False
-            
+        with open(DATA_FILE, 'w', encoding='utf-8') as f:
+            json.dump(posted_jobs, f, indent=2, ensure_ascii=False)
+        log(f"✅ Saved {len(posted_jobs)} jobs to local file")
+        return True
     except Exception as e:
-        log(f"❌ Error saving to Gist: {str(e)}")
+        log(f"❌ Error saving to file: {str(e)}")
         return False
 
 # ====================================
@@ -185,7 +134,7 @@ def scrape_job_detail(job_url):
             current_section = None
             current_content = []
             
-            for element in job_content.find_all(["p"]):
+            for element in job_content.find_all(["h2", "h3", "h4", "h5", "p"]):
                 if element.name in ["h2", "h3", "h4", "h5"]:
                     header_text = element.get_text(strip=True)
                     
@@ -250,10 +199,10 @@ def scrape_job_detail(job_url):
         return None
 
 # ====================================
-# SCRAPE JOBS (with duplicate check using Gist)
+# SCRAPE JOBS (with duplicate check)
 # ====================================
 def scrape_new_jobs(posted_jobs):
-    """Scrape jobs and filter out already posted ones using the posted_jobs dict"""
+    """Scrape jobs and filter out already posted ones"""
     log("🚀 Starting new jobs scrape...")
 
     try:
@@ -271,11 +220,11 @@ def scrape_new_jobs(posted_jobs):
 
         log(f"🔎 Found {len(job_links)} total jobs")
 
-        # Filter out already posted jobs using URL
+        # Filter out already posted jobs
         new_job_links = []
         skipped_count = 0
         for link in job_links[:15]:  # Limit to 15 jobs per cycle
-            if link not in posted_jobs:  # Check using the dict we loaded
+            if link not in posted_jobs:
                 new_job_links.append(link)
             else:
                 skipped_count += 1
@@ -364,13 +313,13 @@ async def job_posting_cycle(bot):
     print(f"     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("═"*60)
     
-    # LOAD POSTED JOBS ONCE at the beginning of the cycle
-    log("📡 Loading posted jobs from Gist...")
+    # LOAD POSTED JOBS from local file
+    log("📡 Loading posted jobs from local storage...")
     posted_jobs = load_posted_jobs()
     log(f"📊 Found {len(posted_jobs)} already posted jobs in history")
     
     log("📡 Fetching new job listings...")
-    new_jobs = scrape_new_jobs(posted_jobs)  # Pass the posted_jobs dict
+    new_jobs = scrape_new_jobs(posted_jobs)
     
     if not new_jobs:
         log("📭 No new jobs found")
@@ -382,22 +331,20 @@ async def job_posting_cycle(bot):
     print("═"*60 + "\n")
     
     posted_count = 0
-    # Update posted_jobs dict as we go
     for index, job in enumerate(new_jobs, 1):
         log(f"📤 [{index}/{len(new_jobs)}] Posting: {job['title'][:30]}...")
         success = await post_job(bot, job)
         if success:
             posted_count += 1
-            # Add to posted_jobs dict immediately
             posted_jobs[job['link']] = datetime.now().isoformat()
         
         if index < len(new_jobs):
             log(f"⏳ Waiting {DELAY_BETWEEN_POSTS} seconds...\n")
             await asyncio.sleep(DELAY_BETWEEN_POSTS)
     
-    # SAVE ALL POSTED JOBS AT ONCE at the end of the cycle
+    # SAVE ALL POSTED JOBS to local file
     if posted_count > 0:
-        log(f"💾 Saving {posted_count} new jobs to Gist...")
+        log(f"💾 Saving {posted_count} new jobs to local storage...")
         save_posted_jobs(posted_jobs)
     
     print("\n" + "═"*60)
@@ -405,7 +352,7 @@ async def job_posting_cycle(bot):
     print("═"*60 + "\n")
 
 # ====================================
-# MAIN LOOP - RUNS EVERY 30 SECONDS
+# MAIN LOOP
 # ====================================
 async def main():
     bot = Bot(token=TOKEN)
@@ -418,20 +365,20 @@ async def main():
     ╚════════════════════════════════════════════╝
     """)
     
-    # Test Gist connection first
-    log("🔍 Testing GitHub Gist connection...")
+    # Test local storage
+    log("🔍 Testing local storage...")
     test_jobs = load_posted_jobs()
-    if isinstance(test_jobs, dict):
-        log(f"✅ GitHub Gist connected successfully! Found {len(test_jobs)} jobs in history")
-    else:
-        log("⚠️ GitHub Gist connection issue, but continuing...")
+    log(f"✅ Local storage ready! Found {len(test_jobs)} jobs in history")
     
     log(f"📋 Channel: {CHANNEL_ID}")
-    log(f"📁 GitHub Gist ID: {GIST_ID}")
+    log(f"📁 Data file: {DATA_FILE}")
     log(f"⏱️  Checking every {SCRAPE_INTERVAL} seconds")
     print("═"*60 + "\n")
     
-    # Run forever
+    # First run check - show if this is first time
+    if len(test_jobs) == 0:
+        log("🎉 First time running! Will start posting new jobs...")
+    
     cycle_count = 0
     while True:
         cycle_count += 1

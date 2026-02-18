@@ -18,7 +18,7 @@ DELAY_BETWEEN_POSTS = 1
 SCRAPE_INTERVAL = 7200  # 2 hours in seconds (7200)
 
 # Local file for storing posted jobs (works on Render)
-DATA_FILE = "posted_jobs.json"
+DATA_FILE = "posted_job.json"
 
 BASE_URL = "https://geezjobs.com"
 URL = "https://geezjobs.com/jobs-in-ethiopia"
@@ -39,7 +39,7 @@ def log(message):
 # ====================================
 def load_posted_jobs():
     """Load previously posted job URLs from local file"""
-    posted_jobs = {}
+    posted_job = {}
     
     try:
         if os.path.exists(DATA_FILE):
@@ -156,7 +156,7 @@ def scrape_job_detail(job_url):
             current_section = None
             current_content = []
             
-            for element in job_content.find_all(["h2", "h3", "h4", "h5", "p"]):
+            for element in job_content.find_all(["p"]):
                 if element.name in ["h2", "h3", "h4", "h5"]:
                     header_text = element.get_text(strip=True)
                     

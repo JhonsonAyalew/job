@@ -157,7 +157,7 @@ def scrape_job_detail(job_url):
             current_content = []
             
             for element in job_content.find_all(["p"]):
-                if element.name in ["h2", "h3", "h4", "h5"]:
+                if element.name in ["p"]:
                     header_text = element.get_text(strip=True)
                     
                     if current_section and current_content:
